@@ -1,3 +1,5 @@
 node_modules
 .env.local
 .vercel
+lol.json
+*.json.key
