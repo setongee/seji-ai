@@ -1,6 +1,13 @@
 import { extractTasks } from "../lib/ai.js";
 import { sendMessage } from "../lib/whatsapp.js";
-import { db } from "../lib/db.js";
+import {
+  db,
+  getConversationHistory,
+  saveConversationTurn,
+  getUser,
+  saveUser,
+  getPendingTasks,
+} from "../lib/db.js";
 
 export default async function handler(req, res) {
   // Meta webhook verification (GET)
@@ -50,7 +57,23 @@ export default async function handler(req, res) {
         return res.status(200).end();
       }
 
-      const { reply, tasks } = await extractTasks(userText, now);
+      const [history, user, pendingTasks] = await Promise.all([
+        getConversationHistory(userPhone),
+        getUser(userPhone),
+        getPendingTasks(userPhone),
+      ]);
+
+      const { reply, tasks, user_name, _raw, _prompt } = await extractTasks(
+        userText,
+        now,
+        { history, userName: user?.name, pendingTasks },
+      );
+
+      await saveConversationTurn(userPhone, _prompt, _raw);
+
+      if (user_name && !user?.name) {
+        await saveUser(userPhone, { name: user_name, created_at: new Date() });
+      }
 
       if (tasks && tasks.length > 0) {
         const batch = db.batch();
