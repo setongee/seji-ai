@@ -1,5 +1,5 @@
 import { extractTasks } from "../lib/ai.js";
-import { sendMessage } from "../lib/whatsapp.js";
+import { sendMessage, sendTyping } from "../lib/whatsapp.js";
 import {
   db,
   getConversationHistory,
@@ -34,17 +34,22 @@ export default async function handler(req, res) {
       }
 
       const message = value.messages[0];
+      const messageId = message.id;
+      const userPhone = message.from;
+      const now = new Date().toISOString();
+
       if (message.type !== "text") {
         await sendMessage(
-          message.from,
+          userPhone,
           "Hey! I can only process text messages for now.",
         );
         return res.status(200).end();
       }
 
+      // Send typing indicator immediately
+      await sendTyping(userPhone, messageId);
+
       const userText = message.text.body;
-      const userPhone = message.from;
-      const now = new Date().toISOString();
 
       const upper = userText.trim().toUpperCase();
       if (upper === "YES" || upper === "DONE") {
