@@ -17,14 +17,14 @@ export default async function handler(req, res) {
 
   // Incoming messages (POST)
   if (req.method === "POST") {
-    res.status(200).end();
-
     try {
       const entry = req.body?.entry?.[0];
       const change = entry?.changes?.[0];
       const value = change?.value;
 
-      if (!value?.messages) return;
+      if (!value?.messages) {
+        return res.status(200).end();
+      }
 
       const message = value.messages[0];
       if (message.type !== "text") {
@@ -32,7 +32,7 @@ export default async function handler(req, res) {
           message.from,
           "Hey! I can only process text messages for now.",
         );
-        return;
+        return res.status(200).end();
       }
 
       const userText = message.text.body;
@@ -43,11 +43,11 @@ export default async function handler(req, res) {
       if (upper === "YES" || upper === "DONE") {
         await handleConfirmation(userPhone, "done");
         await sendMessage(userPhone, "Nice one! Task marked as done. ✅");
-        return;
+        return res.status(200).end();
       }
       if (upper === "SNOOZE") {
         await handleConfirmation(userPhone, "snoozed");
-        return;
+        return res.status(200).end();
       }
 
       const { reply, tasks } = await extractTasks(userText, now);
@@ -73,7 +73,7 @@ export default async function handler(req, res) {
       console.error("Webhook handler error:", err);
     }
 
-    return;
+    return res.status(200).end();
   }
 
   res.setHeader("Allow", ["GET", "POST"]);
