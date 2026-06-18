@@ -18,8 +18,18 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "phone and name are required" });
   }
 
-  // Format phone — strip spaces, ensure no + prefix for WhatsApp API
-  const cleanPhone = phone.replace(/\D/g, "");
+  // Format phone — strip non-digits, handle local Nigerian format
+  let cleanPhone = phone.replace(/\D/g, "");
+
+  // If starts with 0, replace with 234 (Nigeria country code)
+  if (cleanPhone.startsWith("0")) {
+    cleanPhone = "234" + cleanPhone.slice(1);
+  }
+
+  // If starts with +234 or 234 already, strip the + if present
+  if (cleanPhone.startsWith("+")) {
+    cleanPhone = cleanPhone.slice(1);
+  }
 
   const onboardingMessage = `Hey ${name}! 👋
 
