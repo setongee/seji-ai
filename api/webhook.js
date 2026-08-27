@@ -1,5 +1,6 @@
 import { extractTasks } from "../lib/ai.js";
-import { sendMessage, sendTyping, sendButtons } from "../lib/whatsapp.js";
+import { sendMessage, sendTyping, sendButtons, getMediaBuffer } from "../lib/whatsapp.js";
+import { transcribeAudio } from "../lib/transcribe.js";
 import {
   db,
   getConversationHistory,
@@ -45,12 +46,33 @@ export default async function handler(req, res) {
         return res.status(200).end()
       }
 
-      if (message.type !== "text") {
-        await sendMessage(userPhone, "Hey! I can only process text messages for now.");
+      // ── Resolve the incoming message down to plain text ──
+      // Text messages pass through as-is; voice notes get downloaded from
+      // WhatsApp and transcribed first. Everything past this point treats
+      // both the same way.
+      let userText;
+
+      if (message.type === "text") {
+        userText = message.text.body;
+      } else if (message.type === "audio") {
+        try {
+          const { buffer, mimeType } = await getMediaBuffer(message.audio.id);
+          userText = await transcribeAudio(buffer, mimeType);
+        } catch (err) {
+          console.error("Transcription error:", err);
+          await sendMessage(userPhone, "Sorry, I couldn't quite make that out. Mind trying again, or typing it instead?");
+          return res.status(200).end();
+        }
+
+        if (!userText) {
+          await sendMessage(userPhone, "Hmm, that voice note came through empty. Could you try again?");
+          return res.status(200).end();
+        }
+      } else {
+        await sendMessage(userPhone, "Hey! I can only process text or voice messages for now.");
         return res.status(200).end();
       }
 
-      const userText = message.text.body;
       const upper = userText.trim().toUpperCase();
 
       // ── Text shortcut: YES / DONE ──
