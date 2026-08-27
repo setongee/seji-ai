@@ -118,6 +118,14 @@ export default async function handler(req, res) {
       await sendMessage(userPhone, reply);
     } catch (err) {
       console.error("Webhook handler error:", err);
+      try {
+        const userPhone = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0]?.from;
+        if (userPhone) {
+          await sendMessage(userPhone, "Sorry, I hit a snag processing that. Mind trying again in a moment?");
+        }
+      } catch (notifyErr) {
+        console.error("Failed to notify user of error:", notifyErr);
+      }
     }
 
     return res.status(200).end();
