@@ -33,7 +33,13 @@ export default async function handler(req, res) {
       const message = value.messages[0];
       const messageId = message.id;
       const userPhone = message.from;
-      const now = new Date().toISOString();
+      // Express "now" in WAT (UTC+1) with an explicit offset — the AI prompt
+      // tells the model all times are WAT, so it must be handed a WAT
+      // timestamp, not a raw UTC one (toISOString() is always UTC/"Z" and
+      // was silently running every calculation an hour behind).
+      const now = new Date(Date.now() + 60 * 60 * 1000)
+        .toISOString()
+        .replace("Z", "+01:00");
 
       await sendTyping(userPhone, messageId);
 
