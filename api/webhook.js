@@ -55,6 +55,11 @@ export default async function handler(req, res) {
       if (message.type === "text") {
         userText = message.text.body;
       } else if (message.type === "audio") {
+        const audioUser = await getUser(userPhone);
+        const greeting = audioUser?.name ? `Hi ${audioUser.name}` : "Hey";
+        await sendMessage(userPhone, `${greeting}, listening to your voice note... I'll reply soon 🎧`);
+        await sendTyping(userPhone, messageId); // sending that message just dismissed the bubble — bring it back
+
         try {
           const { buffer, mimeType } = await getMediaBuffer(message.audio.id);
           userText = await transcribeAudio(buffer, mimeType);
