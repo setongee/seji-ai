@@ -1,6 +1,7 @@
 import { extractTasks } from "../lib/ai.js";
 import { sendMessage, sendTyping, sendButtons, getMediaBuffer } from "../lib/whatsapp.js";
 import { transcribeAudio } from "../lib/transcribe.js";
+import { nowWAT, formatWATTime } from "../lib/time.js";
 import {
   db,
   getConversationHistory,
@@ -33,13 +34,7 @@ export default async function handler(req, res) {
       const message = value.messages[0];
       const messageId = message.id;
       const userPhone = message.from;
-      // Express "now" in WAT (UTC+1) with an explicit offset — the AI prompt
-      // tells the model all times are WAT, so it must be handed a WAT
-      // timestamp, not a raw UTC one (toISOString() is always UTC/"Z" and
-      // was silently running every calculation an hour behind).
-      const now = new Date(Date.now() + 60 * 60 * 1000)
-        .toISOString()
-        .replace("Z", "+01:00");
+      const now = nowWAT();
 
       await sendTyping(userPhone, messageId);
 
@@ -113,7 +108,7 @@ export default async function handler(req, res) {
         getPendingTasks(userPhone),
       ]);
 
-      const { reply, tasks, user_name, _raw, _prompt } = await extractTasks(
+      const { reply, tasks, task_update, user_name, _raw, _prompt } = await extractTasks(
         userText,
         now,
         { history, userName: user?.name, pendingTasks }
@@ -123,6 +118,10 @@ export default async function handler(req, res) {
 
       if (user_name && !user?.name) {
         await saveUser(userPhone, { name: user_name, created_at: new Date() });
+      }
+
+      if (task_update?.task_id) {
+        await applyTaskUpdate(userPhone, task_update);
       }
 
       if (tasks && tasks.length > 0) {
@@ -229,8 +228,8 @@ async function handleButtonReply(phone, buttonId) {
       } else {
         const list = tasks.map((t, i) => {
           let time = "";
-          if (t.starts_at && t.ends_at) time = `\n   🕐 ${t.starts_at} → ${t.ends_at}`;
-          else if (t.remind_at) time = `\n   ⏰ ${t.remind_at}`;
+          if (t.starts_at && t.ends_at) time = `\n   🕐 ${formatWATTime(t.starts_at)} → ${formatWATTime(t.ends_at)}`;
+          else if (t.remind_at) time = `\n   ⏰ ${formatWATTime(t.remind_at)}`;
           return `${i + 1}. *${t.title}*${time}`;
         }).join("\n\n");
         await sendMessage(phone, `Here's everything on your plate:\n\n${list}`);
@@ -268,6 +267,51 @@ async function handleConfirmation(phone, newStatus) {
   } else {
     await doc.ref.update({ status: "done" });
   }
+}
+
+// ── Apply an AI-decided edit/cancel to an EXISTING pending task ──
+// This is what lets natural language ("extend this by 30 mins", "push my
+// 3pm call to 4") modify a task in place instead of the AI's only option
+// being to create a brand new one — which used to leave the original
+// untouched and fire twice.
+async function applyTaskUpdate(phone, update) {
+  const ref = db.collection("tasks").doc(update.task_id);
+  const snap = await ref.get();
+
+  // Ignore silently if the id is stale/invalid or (defensively) belongs to
+  // someone else — the AI only ever sees this user's own pending tasks, so
+  // this should never trip, but it's a cheap safety net.
+  if (!snap.exists || snap.data().phone !== phone) return;
+
+  if (update.cancel) {
+    await ref.update({ status: "done" });
+    return;
+  }
+
+  const prevStatus = snap.data().status;
+  const fieldUpdates = {
+    start_notified: false,
+    checkin_30_sent: false,
+    checkin_60_sent: false,
+    checkin_5min_sent: false,
+    end_notified: false,
+  };
+
+  if (update.new_remind_at) {
+    fieldUpdates.remind_at = new Date(update.new_remind_at);
+    fieldUpdates.status = "pending"; // ready for cron to fire again at the new time
+  }
+  if (update.new_starts_at) fieldUpdates.starts_at = new Date(update.new_starts_at);
+  if (update.new_ends_at) fieldUpdates.ends_at = new Date(update.new_ends_at);
+
+  if ((update.new_starts_at || update.new_ends_at) && !update.new_remind_at) {
+    // Timed-task edit: if it was already underway/awaiting confirmation, put
+    // it back into "active" so cron re-processes the new end time. If it
+    // hasn't started yet, leave it "pending" so the normal start flow fires.
+    fieldUpdates.status = prevStatus === "pending" ? "pending" : "active";
+  }
+
+  await ref.update(fieldUpdates);
 }
 
 // ── Extend the currently active timed task by N minutes ──

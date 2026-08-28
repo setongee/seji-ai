@@ -84,15 +84,20 @@ export default async function handler(req, res) {
         fired++
       }
 
-      if (!starts || nowMs < starts.getTime()) return
+      // Elapsed-time check-ins only make sense once a task has a known
+      // start — but a task can have an ends_at with no starts_at (e.g. a
+      // reminder extended into a deadline), so only bail out here when
+      // there's a start time to wait on. The end-of-task check below must
+      // still run for start-less tasks — it used to be skipped entirely,
+      // silently stranding those tasks forever.
+      if (starts && nowMs < starts.getTime()) return
 
-      const elapsedMs = nowMs - starts.getTime()
-      const elapsedMins = elapsedMs / 60000
+      const elapsedMins = starts ? (nowMs - starts.getTime()) / 60000 : null
       const remainingMs = ends ? ends.getTime() - nowMs : null
       const remainingMins = remainingMs ? remainingMs / 60000 : null
 
       // ── 30-minute check-in ──
-      if (!task.checkin_30_sent && elapsedMins >= 30 && elapsedMins < 35) {
+      if (starts && !task.checkin_30_sent && elapsedMins >= 30 && elapsedMins < 35) {
         const remaining = remainingMins ? `About *${Math.round(remainingMins)} mins* left.` : ''
         await sendButtons(
           phone,
@@ -107,7 +112,7 @@ export default async function handler(req, res) {
       }
 
       // ── 60-minute check-in ──
-      if (!task.checkin_60_sent && elapsedMins >= 60 && elapsedMins < 65) {
+      if (starts && !task.checkin_60_sent && elapsedMins >= 60 && elapsedMins < 65) {
         const remaining = remainingMins ? `Just *${Math.round(remainingMins)} mins* to go.` : ''
         await sendButtons(
           phone,
