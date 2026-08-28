@@ -1,6 +1,7 @@
 import { extractTasks } from "../lib/ai.js";
 import { sendMessage, sendTyping, sendButtons, getMediaBuffer } from "../lib/whatsapp.js";
 import { transcribeAudio } from "../lib/transcribe.js";
+import { compressImage } from "../lib/image.js";
 import { nowWAT, formatWATTime } from "../lib/time.js";
 import {
   db,
@@ -47,11 +48,13 @@ export default async function handler(req, res) {
         return res.status(200).end()
       }
 
-      // ── Resolve the incoming message down to plain text ──
+      // ── Resolve the incoming message down to plain text (+ optional image) ──
       // Text messages pass through as-is; voice notes get downloaded from
-      // WhatsApp and transcribed first. Everything past this point treats
-      // both the same way.
+      // WhatsApp and transcribed first; photos get downloaded and handed to
+      // the AI directly as vision input. Everything past this point treats
+      // all three the same way.
       let userText;
+      let imageData = null;
 
       if (message.type === "text") {
         userText = message.text.body;
@@ -74,8 +77,25 @@ export default async function handler(req, res) {
           await sendMessage(userPhone, "Hmm, that voice note came through empty. Could you try again?");
           return res.status(200).end();
         }
+      } else if (message.type === "image") {
+        const imageUser = await getUser(userPhone);
+        const greeting = imageUser?.name ? `Hi ${imageUser.name}` : "Hey";
+        await sendMessage(userPhone, `${greeting}, taking a look at your photo... I'll reply soon 👀`);
+        await sendTyping(userPhone, messageId); // bring the bubble back after that message dismissed it
+
+        try {
+          const { buffer } = await getMediaBuffer(message.image.id);
+          const compressed = await compressImage(buffer);
+          imageData = { base64: compressed.buffer.toString("base64"), mimeType: compressed.mimeType };
+        } catch (err) {
+          console.error("Image download error:", err);
+          await sendMessage(userPhone, "Sorry, I couldn't load that photo. Mind trying again?");
+          return res.status(200).end();
+        }
+
+        userText = message.image.caption || "[Photo attached, no caption — read the image for tasks/to-dos.]";
       } else {
-        await sendMessage(userPhone, "Hey! I can only process text or voice messages for now.");
+        await sendMessage(userPhone, "Hey! I can only process text, voice notes, or photos for now.");
         return res.status(200).end();
       }
 
@@ -111,7 +131,7 @@ export default async function handler(req, res) {
       const { reply, tasks, task_update, user_name, _raw, _prompt } = await extractTasks(
         userText,
         now,
-        { history, userName: user?.name, pendingTasks }
+        { history, userName: user?.name, pendingTasks, image: imageData }
       );
 
       await saveConversationTurn(userPhone, _prompt, _raw);
