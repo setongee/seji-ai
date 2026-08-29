@@ -1,5 +1,5 @@
 import { extractTasks } from "../lib/ai.js";
-import { sendMessage, sendTyping, sendButtons, sendFlow, getMediaBuffer } from "../lib/whatsapp.js";
+import { sendMessage, sendTyping, sendButtons, getMediaBuffer } from "../lib/whatsapp.js";
 import { transcribeAudio } from "../lib/transcribe.js";
 import { compressImage } from "../lib/image.js";
 import { nowWAT, formatWATTime } from "../lib/time.js";
@@ -19,9 +19,9 @@ import {
   markAllTasksDone,
 } from "../lib/db.js";
 
-const PIN_FLOW_ID = process.env.PIN_FLOW_ID;
-const PIN_SCREEN_ID = "PIN_SCREEN";
-
+// PIN_FLOW_ID (4339270906334590, "seji_pin_confirm") still exists in Meta —
+// swap the text-based trigger below for sendFlow() from lib/whatsapp.js once
+// the WABA is business-verified and Flows actually deliver.
 const BULK_ACTION_LABELS = {
   clear_all: "clear all your tasks",
   mark_all_done: "mark all your tasks done",
@@ -60,12 +60,32 @@ export default async function handler(req, res) {
           await handleButtonReply(userPhone, buttonId)
         }
 
-        // ── PIN Flow submission ──
+        // ── PIN Flow submission (dormant until the WABA is business-verified —
+        // see the text-based fallback below for what's actually live today) ──
         if (message.interactive?.type === "nfm_reply") {
-          await handlePinSubmission(userPhone, message.interactive.nfm_reply)
+          let response;
+          try { response = JSON.parse(message.interactive.nfm_reply.response_json); } catch { response = null; }
+          if (response?.pin) await handlePinSubmission(userPhone, response.pin);
         }
 
         return res.status(200).end()
+      }
+
+      const user = await getUser(userPhone);
+
+      // ── Text-based PIN confirmation reply ──
+      // Flows need the WABA to be business-verified (not the case yet — see
+      // sendFlow in lib/whatsapp.js, kept ready for when it is). Until then,
+      // a pending bulk action is confirmed by just replying with digits.
+      // Anything else while one's pending is treated as "never mind" —
+      // clears it rather than trapping the user into only accepting a PIN.
+      if (message.type === "text" && user?.pending_action) {
+        const attempt = message.text.body.trim();
+        if (/^\d{4,}$/.test(attempt)) {
+          await handlePinSubmission(userPhone, attempt);
+          return res.status(200).end();
+        }
+        await clearPendingAction(userPhone);
       }
 
       // ── Resolve the incoming message down to plain text (+ optional image) ──
@@ -79,8 +99,7 @@ export default async function handler(req, res) {
       if (message.type === "text") {
         userText = message.text.body;
       } else if (message.type === "audio") {
-        const audioUser = await getUser(userPhone);
-        const greeting = audioUser?.name ? `Hi ${audioUser.name}` : "Hey";
+        const greeting = user?.name ? `Hi ${user.name}` : "Hey";
         await sendMessage(userPhone, `${greeting}, listening to your voice note... I'll reply soon 🎧`);
         await sendTyping(userPhone, messageId); // sending that message just dismissed the bubble — bring it back
 
@@ -98,8 +117,7 @@ export default async function handler(req, res) {
           return res.status(200).end();
         }
       } else if (message.type === "image") {
-        const imageUser = await getUser(userPhone);
-        const greeting = imageUser?.name ? `Hi ${imageUser.name}` : "Hey";
+        const greeting = user?.name ? `Hi ${user.name}` : "Hey";
         await sendMessage(userPhone, `${greeting}, taking a look at your photo... I'll reply soon 👀`);
         await sendTyping(userPhone, messageId); // bring the bubble back after that message dismissed it
 
@@ -141,10 +159,9 @@ export default async function handler(req, res) {
         return res.status(200).end();
       }
 
-      // ── Normal AI flow ──
-      const [history, user, pendingTasks] = await Promise.all([
+      // ── Normal AI flow ── (user was already fetched above)
+      const [history, pendingTasks] = await Promise.all([
         getConversationHistory(userPhone),
-        getUser(userPhone),
         getPendingTasks(userPhone),
       ]);
 
@@ -164,26 +181,21 @@ export default async function handler(req, res) {
         await applyTaskUpdate(userPhone, task_update);
       }
 
-      // ── Bulk action requested — hold off executing, gate behind a PIN Flow ──
+      // ── Bulk action requested — hold off executing, gate behind a PIN ──
+      // Text-based for now (see note above on Flows needing verification).
       if (bulk_action && BULK_ACTION_LABELS[bulk_action]) {
         await sendMessage(userPhone, reply);
 
-        const flowToken = crypto.randomUUID();
+        const flowToken = crypto.randomUUID(); // still useful as an internal correlation id
         await setPendingAction(userPhone, { type: bulk_action, flowToken });
 
         const hasPin = Boolean(user?.pin_hash);
-        await sendFlow(userPhone, {
-          flowId: PIN_FLOW_ID,
-          screenId: PIN_SCREEN_ID,
-          flowToken,
-          bodyText: hasPin
-            ? `Confirm: ${BULK_ACTION_LABELS[bulk_action]}`
-            : "First, let's set a PIN to protect actions like this.",
-          ctaText: hasPin ? "Confirm" : "Set PIN",
-          promptText: hasPin
-            ? `Enter your PIN to confirm: ${BULK_ACTION_LABELS[bulk_action]}`
-            : "Set a PIN (4+ digits) to protect bulk actions:",
-        });
+        await sendMessage(
+          userPhone,
+          hasPin
+            ? `🔒 To confirm: ${BULK_ACTION_LABELS[bulk_action]}. Reply with your PIN.`
+            : `🔒 Let's set a PIN to protect actions like this — reply with 4+ digits. This will also confirm the action above.`
+        );
 
         return res.status(200).end();
       }
@@ -231,21 +243,14 @@ export default async function handler(req, res) {
   res.status(405).end();
 }
 
-// ── Handle a PIN Flow submission ──
+// ── Handle a PIN submission (text reply today; Flow nfm_reply once the WABA
+// is business-verified — both funnel into this same function) ──
 // Two cases, distinguished by whether the user already has a PIN set:
 // no PIN yet → this submission IS the new PIN (set it, then run the action
 // that prompted it, since entering a fresh PIN here is itself the consent).
 // PIN already set → verify it before running the action; wrong PIN cancels
 // the action entirely rather than looping back into the form.
-async function handlePinSubmission(phone, nfmReply) {
-  let response;
-  try {
-    response = JSON.parse(nfmReply.response_json);
-  } catch {
-    return; // malformed/unexpected payload — nothing we can do with it
-  }
-
-  const pin = response.pin;
+async function handlePinSubmission(phone, pin) {
   const user = await getUser(phone);
   const pending = user?.pending_action;
 
