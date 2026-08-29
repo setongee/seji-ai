@@ -4,6 +4,7 @@ import { transcribeAudio } from "../lib/transcribe.js";
 import { compressImage } from "../lib/image.js";
 import { nowWAT, formatWATTime } from "../lib/time.js";
 import { hashPin, verifyPin } from "../lib/pin.js";
+import { listRecentEmails, sendEmail } from "../lib/gmail.js";
 import {
   db,
   getConversationHistory,
@@ -17,6 +18,9 @@ import {
   clearPendingAction,
   clearAllTasks,
   markAllTasksDone,
+  createGmailConnectState,
+  setPendingEmail,
+  clearPendingEmail,
 } from "../lib/db.js";
 
 // PIN_FLOW_ID (4339270906334590, "seji_pin_confirm") still exists in Meta —
@@ -26,6 +30,8 @@ const BULK_ACTION_LABELS = {
   clear_all: "clear all your tasks",
   mark_all_done: "mark all your tasks done",
 };
+
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL;
 
 export default async function handler(req, res) {
   if (req.method === "GET") {
@@ -86,6 +92,27 @@ export default async function handler(req, res) {
           return res.status(200).end();
         }
         await clearPendingAction(userPhone);
+      }
+
+      // ── Drafted-email send confirmation ──
+      // Seji never sends an email without this — a plain "SEND" reply is
+      // the only thing that triggers it. Anything else clears the draft
+      // rather than trapping the user (they can just re-ask to redraft).
+      if (message.type === "text" && user?.pending_email) {
+        const attempt = message.text.body.trim().toUpperCase();
+        if (attempt === "SEND") {
+          try {
+            await sendEmail(user.gmail_refresh_token, user.pending_email);
+            await clearPendingEmail(userPhone);
+            await sendMessage(userPhone, `Sent! ✅ To: ${user.pending_email.to}`);
+          } catch (err) {
+            console.error("Gmail send error:", err);
+            await clearPendingEmail(userPhone);
+            await sendMessage(userPhone, "Hmm, that email didn't send. Mind trying again?");
+          }
+          return res.status(200).end();
+        }
+        await clearPendingEmail(userPhone);
       }
 
       // ── Resolve the incoming message down to plain text (+ optional image) ──
@@ -165,10 +192,10 @@ export default async function handler(req, res) {
         getPendingTasks(userPhone),
       ]);
 
-      const { reply, tasks, task_update, bulk_action, user_name, _raw, _prompt } = await extractTasks(
+      const { reply, tasks, task_update, bulk_action, email_action, user_name, _raw, _prompt } = await extractTasks(
         userText,
         now,
-        { history, userName: user?.name, pendingTasks, image: imageData }
+        { history, userName: user?.name, pendingTasks, image: imageData, gmailConnected: Boolean(user?.gmail_refresh_token) }
       );
 
       await saveConversationTurn(userPhone, _prompt, _raw);
@@ -196,6 +223,44 @@ export default async function handler(req, res) {
             ? `🔒 To confirm: ${BULK_ACTION_LABELS[bulk_action]}. Reply with your PIN.`
             : `🔒 Let's set a PIN to protect actions like this — reply with 4+ digits. This will also confirm the action above.`
         );
+
+        return res.status(200).end();
+      }
+
+      // ── Email action requested ──
+      // Defensive check on "draft": only act on it if there's a real-looking
+      // address — the model is instructed never to set draft without one,
+      // but this is cheap insurance against sending to `undefined`.
+      const validEmailAction = email_action?.type && (email_action.type !== "draft" || email_action.to?.includes("@"));
+
+      if (validEmailAction) {
+        await sendMessage(userPhone, reply);
+
+        if (email_action.type === "connect") {
+          const state = await createGmailConnectState(userPhone);
+          await sendMessage(userPhone, `Tap to connect: ${PUBLIC_BASE_URL}/api/gmail/auth?state=${state}`);
+        } else if (email_action.type === "check") {
+          try {
+            const emails = await listRecentEmails(user.gmail_refresh_token, { maxResults: 8, query: email_action.query || "" });
+            if (emails.length === 0) {
+              await sendMessage(userPhone, "Nothing there — inbox is clear 📭");
+            } else {
+              const list = emails
+                .map((e, i) => `${i + 1}. *${e.subject}*\n   ${e.from}\n   ${e.snippet}`)
+                .join("\n\n");
+              await sendMessage(userPhone, `📬 Here's what's there:\n\n${list}`);
+            }
+          } catch (err) {
+            console.error("Gmail check error:", err);
+            await sendMessage(userPhone, "Couldn't reach your inbox just now — mind trying again?");
+          }
+        } else if (email_action.type === "draft") {
+          await setPendingEmail(userPhone, { to: email_action.to, subject: email_action.subject, body: email_action.body });
+          await sendMessage(
+            userPhone,
+            `📧 *To:* ${email_action.to}\n*Subject:* ${email_action.subject}\n\n${email_action.body}\n\nReply *SEND* to send this, or tell me what to change.`
+          );
+        }
 
         return res.status(200).end();
       }
