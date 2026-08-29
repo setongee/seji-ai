@@ -1,8 +1,9 @@
 import { extractTasks } from "../lib/ai.js";
-import { sendMessage, sendTyping, sendButtons, getMediaBuffer } from "../lib/whatsapp.js";
+import { sendMessage, sendTyping, sendButtons, sendFlow, getMediaBuffer } from "../lib/whatsapp.js";
 import { transcribeAudio } from "../lib/transcribe.js";
 import { compressImage } from "../lib/image.js";
 import { nowWAT, formatWATTime } from "../lib/time.js";
+import { hashPin, verifyPin } from "../lib/pin.js";
 import {
   db,
   getConversationHistory,
@@ -11,7 +12,20 @@ import {
   saveUser,
   getPendingTasks,
   cascadeReschedule,
+  setUserPin,
+  setPendingAction,
+  clearPendingAction,
+  clearAllTasks,
+  markAllTasksDone,
 } from "../lib/db.js";
+
+const PIN_FLOW_ID = process.env.PIN_FLOW_ID;
+const PIN_SCREEN_ID = "PIN_SCREEN";
+
+const BULK_ACTION_LABELS = {
+  clear_all: "clear all your tasks",
+  mark_all_done: "mark all your tasks done",
+};
 
 export default async function handler(req, res) {
   if (req.method === "GET") {
@@ -45,6 +59,12 @@ export default async function handler(req, res) {
         if (buttonId) {
           await handleButtonReply(userPhone, buttonId)
         }
+
+        // ── PIN Flow submission ──
+        if (message.interactive?.type === "nfm_reply") {
+          await handlePinSubmission(userPhone, message.interactive.nfm_reply)
+        }
+
         return res.status(200).end()
       }
 
@@ -128,7 +148,7 @@ export default async function handler(req, res) {
         getPendingTasks(userPhone),
       ]);
 
-      const { reply, tasks, task_update, user_name, _raw, _prompt } = await extractTasks(
+      const { reply, tasks, task_update, bulk_action, user_name, _raw, _prompt } = await extractTasks(
         userText,
         now,
         { history, userName: user?.name, pendingTasks, image: imageData }
@@ -142,6 +162,30 @@ export default async function handler(req, res) {
 
       if (task_update?.task_id) {
         await applyTaskUpdate(userPhone, task_update);
+      }
+
+      // ── Bulk action requested — hold off executing, gate behind a PIN Flow ──
+      if (bulk_action && BULK_ACTION_LABELS[bulk_action]) {
+        await sendMessage(userPhone, reply);
+
+        const flowToken = crypto.randomUUID();
+        await setPendingAction(userPhone, { type: bulk_action, flowToken });
+
+        const hasPin = Boolean(user?.pin_hash);
+        await sendFlow(userPhone, {
+          flowId: PIN_FLOW_ID,
+          screenId: PIN_SCREEN_ID,
+          flowToken,
+          bodyText: hasPin
+            ? `Confirm: ${BULK_ACTION_LABELS[bulk_action]}`
+            : "First, let's set a PIN to protect actions like this.",
+          ctaText: hasPin ? "Confirm" : "Set PIN",
+          promptText: hasPin
+            ? `Enter your PIN to confirm: ${BULK_ACTION_LABELS[bulk_action]}`
+            : "Set a PIN (4+ digits) to protect bulk actions:",
+        });
+
+        return res.status(200).end();
       }
 
       if (tasks && tasks.length > 0) {
@@ -185,6 +229,62 @@ export default async function handler(req, res) {
 
   res.setHeader("Allow", ["GET", "POST"]);
   res.status(405).end();
+}
+
+// ── Handle a PIN Flow submission ──
+// Two cases, distinguished by whether the user already has a PIN set:
+// no PIN yet → this submission IS the new PIN (set it, then run the action
+// that prompted it, since entering a fresh PIN here is itself the consent).
+// PIN already set → verify it before running the action; wrong PIN cancels
+// the action entirely rather than looping back into the form.
+async function handlePinSubmission(phone, nfmReply) {
+  let response;
+  try {
+    response = JSON.parse(nfmReply.response_json);
+  } catch {
+    return; // malformed/unexpected payload — nothing we can do with it
+  }
+
+  const pin = response.pin;
+  const user = await getUser(phone);
+  const pending = user?.pending_action;
+
+  if (!pin || !pending) {
+    await sendMessage(phone, "That confirmation seems to have expired — go ahead and ask again if you still want to.");
+    return;
+  }
+
+  const label = BULK_ACTION_LABELS[pending.type];
+
+  const runAction = async () => {
+    if (pending.type === "clear_all") {
+      const count = await clearAllTasks(phone);
+      await sendMessage(phone, count > 0 ? `Done — cleared ${count} task${count === 1 ? "" : "s"}. Clean slate ✨` : "You were already all clear!");
+    } else if (pending.type === "mark_all_done") {
+      const count = await markAllTasksDone(phone);
+      await sendMessage(phone, count > 0 ? `Done — marked ${count} task${count === 1 ? "" : "s"} complete. 🎉` : "Nothing pending to mark done!");
+    }
+  };
+
+  if (!user.pin_hash) {
+    // First-time setup — this PIN entry is the new PIN, and also doubles as
+    // consent to go ahead with whatever prompted it.
+    const { salt, hash } = hashPin(pin);
+    await setUserPin(phone, salt, hash);
+    await clearPendingAction(phone);
+    await sendMessage(phone, "PIN set! I'll ask for it before anything like this from now on.");
+    await runAction();
+    return;
+  }
+
+  await clearPendingAction(phone);
+
+  if (!verifyPin(pin, user.pin_salt, user.pin_hash)) {
+    await sendMessage(phone, `That PIN didn't match — I haven't touched anything. Ask again to ${label} if you still want to.`);
+    return;
+  }
+
+  await runAction();
 }
 
 // ── Route button reply IDs to the right action ──
